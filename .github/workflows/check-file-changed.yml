@@ -18,19 +18,25 @@ jobs:
         with:
           script: |
             const diff_url = context.payload.pull_request.diff_url
-            const diff = await github.request(diff_url)
+            try {
+              const diff = await github.request(diff_url)
 
-            const parse = require('parse-diff')
-            const files = (parse(diff.data || '') || [])
+              const parse = require('parse-diff')
+              const files = (parse(diff.data || '') || [])
 
-            const filePath = '${{ inputs.filePath }}'
-            const fileDiff = files.filter(x => x.to === filePath)
+              const filePath = '${{ inputs.filePath }}'
+              const fileDiff = files.filter(x => x.to === filePath)
 
-            if (fileDiff.length > 0) {
-              const file = fileDiff[0]
-              core.setOutput('justBeenCreated', file.new)
-              core.setOutput('hasBeenUpdated', true)
-            } else {
+              if (fileDiff.length > 0) {
+                const file = fileDiff[0]
+                core.setOutput('justBeenCreated', file.new)
+                core.setOutput('hasBeenUpdated', true)
+              } else {
+                core.setOutput('justBeenCreated', false)
+                core.setOutput('hasBeenUpdated', false)
+              }
+            } catch (err) {
+              core.warning(`Could not completely get file diff. Reason: ${err}`)
               core.setOutput('justBeenCreated', false)
               core.setOutput('hasBeenUpdated', false)
             }
