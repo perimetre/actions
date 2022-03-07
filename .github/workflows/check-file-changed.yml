@@ -1,0 +1,43 @@
+name: Check new file diff
+on:
+  workflow_call:
+    inputs:
+      filePath:
+        required: true
+        type: string
+
+jobs:
+  check-changelog-update:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm install parse-diff
+
+      - uses: actions/github-script@v6
+        name: Setup file diff variables
+        id: diff-result
+        with:
+          script: |
+            const diff_url = context.payload.pull_request.diff_url
+            const diff = await github.request(diff_url)
+
+            const parse = require('parse-diff')
+            const files = (parse(diff.data || '') || [])
+
+            const filePath = '${{ inputs.filePath }}'
+            const fileDiff = files.filter(x => x.to === filePath)
+
+            if (fileDiff.length > 0) {
+              const file = fileDiff[0]
+              core.setOutput('justBeenCreated', file.new)
+              core.setOutput('hasBeenUpdated', true)
+            } else {
+              core.setOutput('justBeenCreated', false)
+              core.setOutput('hasBeenUpdated', false)
+            }
+
+      - name: Fail if not new or skip otherwise
+        if: ${{ steps.diff-result.outputs.hasBeenUpdated != 'true' }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.setFailed('"${{ inputs.filePath }}" has not been updated')
