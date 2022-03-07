@@ -1,0 +1,54 @@
+name: Check new package version
+on:
+  workflow_call:
+
+jobs:
+  check-package-version:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm install semver
+
+      - uses: actions/github-script@v6
+        name: Setup package.json variables
+        id: npm-version
+        with:
+          script: |
+            const getPackageVersion = async (ref) => {
+              if (!ref) return undefined
+              try {
+                const data = (await github.rest.repos.getContent({ ...context.repo, path: 'package.json', ref })).data.content
+                return JSON.parse(Buffer.from(data, 'base64').toString()).version
+              } catch (err) {
+                core.warning(`Could not completely get version, returning undefined. Reason: ${err}`)
+                core.debug(err);
+                return undefined
+              }
+            }
+
+            const currentRef = context.sha
+            const previousRef = ((await github.rest.repos.getCommit({...context.repo, ref: currentRef })).data.parents[0] || {}).sha
+
+            const currentVersion = await getPackageVersion(currentRef)
+            const previousVersion = await getPackageVersion(previousRef)
+
+            core.setOutput('currentVersion', currentVersion)
+            core.setOutput('previousVersion', previousVersion)
+
+            if (!previousVersion) {
+              core.setOutput('matches', false)
+              core.setOutput('isNewer', true)
+            } else {
+              const semver = require('semver')
+              const currentSemver = semver.parse(currentVersion)
+              const previousSemver = semver.parse(previousVersion)
+              core.setOutput('matches', semver.eq(currentSemver.version, previousSemver.version))
+              core.setOutput('isNewer', semver.gt(currentSemver.version, previousSemver.version))
+              core.setOutput('diff', semver.diff(currentSemver.version, previousSemver.version))
+            }
+
+      - name: Fail if not new or skip otherwise
+        if: ${{ steps.npm-version.outputs.isNewer != 'true' }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.setFailed('package.json version number has not been updated')
