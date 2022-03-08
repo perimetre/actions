@@ -3,7 +3,7 @@ on:
   workflow_call:
 
 jobs:
-  check-package-version:
+  check_package_version:
     runs-on: ubuntu-latest
     steps:
       - run: npm install semver

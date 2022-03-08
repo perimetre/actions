@@ -7,7 +7,7 @@ on:
         type: string
 
 jobs:
-  check-file-changed:
+  check_file_changed:
     runs-on: ubuntu-latest
     steps:
       - run: npm install parse-diff
