@@ -1,0 +1,425 @@
+name: Slack PR Notifications
+
+# Sends Slack notifications for PR interactions:
+# - New PRs opened
+# - Code review requested (tags the requested reviewer)
+# - New comments from humans (non-bots) on PRs
+# - Code review submissions (approved, changes requested, commented)
+# - Sends messages AS the GitHub user (uses their Slack avatar and name)
+#
+# Prerequisites:
+# - SLACK_BOT_TOKEN secret (organization or repository)
+#   Required scopes: chat:write.customize, users:read, users:read.email
+# - SLACK_CHANNEL_ID variable (organization or repository)
+# - SLACK_USER_MAPPING variable (optional)
+#   JSON mapping of GitHub username to Slack user ID for manual overrides
+#   Example: {"singithi-kandage": "U12345678", "assisrmatheus": "U87654321"}
+#   To get Slack user IDs: Click user profile > More > Copy member ID
+#
+# How it works:
+# 1. Looks up GitHub user (PR author, commenter, reviewer) in Slack:
+#    - First checks manual SLACK_USER_MAPPING if configured
+#    - Then tries email matching (GitHub email → Slack email)
+#    - Falls back to name matching if email not available
+# 2. If matched, sends message with user's Slack name and avatar
+#    (appears as if the user posted it themselves)
+# 3. If not matched, sends as bot with default appearance
+# 4. Processes @mentions in comments/reviews and tags corresponding Slack users
+
+on:
+  workflow_call:
+    inputs:
+      slack_channel_id:
+        description: 'Slack channel ID where notifications will be sent'
+        required: true
+        type: string
+      slack_user_mapping:
+        description: 'Optional JSON mapping of GitHub username to Slack user ID'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      slack_bot_token:
+        description: 'Slack bot token with required scopes'
+        required: true
+
+jobs:
+  # Notifies when a new PR is opened
+  notify-new-pr:
+    runs-on: ubuntu-latest
+    # Only run if PR author is not a bot
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action == 'opened' &&
+      github.event.pull_request.user.type != 'Bot'
+    steps:
+      - name: Checkout actions repository
+        uses: actions/checkout@v4
+        with:
+          repository: perimetre/actions
+          ref: master
+          path: .actions
+
+      # Look up PR author in Slack to get their profile
+      - name: Get Slack user profile for PR author
+        id: slack-user
+        uses: actions/github-script@v8
+        env:
+          GITHUB_USERNAME: ${{ github.event.pull_request.user.login }}
+          SLACK_BOT_TOKEN: ${{ secrets.slack_bot_token }}
+          SLACK_USER_MAPPING: ${{ inputs.slack_user_mapping }}
+        with:
+          script: |
+            const { findSlackUser, getSlackUserProfile } = require('./.actions/.github/scripts/slack-user-lookup.js');
+
+            const githubUsername = process.env.GITHUB_USERNAME;
+            const slackToken = process.env.SLACK_BOT_TOKEN;
+            const userMapping = process.env.SLACK_USER_MAPPING;
+
+            const slackUser = await findSlackUser({
+              githubUsername,
+              slackToken,
+              userMapping,
+              github,
+              core
+            });
+
+            const profile = getSlackUserProfile(slackUser);
+            core.setOutput('username', profile.username);
+            core.setOutput('icon_url', profile.icon_url);
+            core.setOutput('matched', profile.matched.toString());
+
+      - name: Send new PR notification
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.slack_bot_token }}
+          payload-templated: true
+          payload: |
+            channel: ${{ inputs.slack_channel_id }}
+            text: "New PR: ${{ github.event.pull_request.title }}"
+            username: "${{ steps.slack-user.outputs.username || '' }}"
+            icon_url: "${{ steps.slack-user.outputs.icon_url || '' }}"
+            blocks:
+              - type: section
+                text:
+                  type: mrkdwn
+                  text: "*<${{ github.event.pull_request.html_url }}|${{ github.event.pull_request.title }}>*${{ github.event.pull_request.body && format('\n{0}', github.event.pull_request.body) || '' }}"
+              - type: context
+                elements:
+                  - type: mrkdwn
+                    text: "<${{ github.event.pull_request.html_url }}|#${{ github.event.pull_request.number }}> • ${{ github.event.pull_request.user.login }} • `${{ github.event.pull_request.head.ref }}` → `${{ github.event.pull_request.base.ref }}`"
+
+  # Notifies when a review is requested and tags the requested reviewer
+  notify-review-requested:
+    runs-on: ubuntu-latest
+    # Only run if review was requested from a user (not a team or bot)
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action == 'review_requested' &&
+      github.event.requested_reviewer != null &&
+      github.event.requested_reviewer.type != 'Bot'
+    steps:
+      - name: Checkout actions repository
+        uses: actions/checkout@v4
+        with:
+          repository: perimetre/actions
+          ref: master
+          path: .actions
+
+      # Look up requested reviewer and request sender in Slack
+      - name: Get Slack profiles
+        id: slack-users
+        uses: actions/github-script@v8
+        env:
+          REQUESTED_REVIEWER: ${{ github.event.requested_reviewer.login }}
+          REQUEST_SENDER: ${{ github.event.sender.login }}
+          SLACK_BOT_TOKEN: ${{ secrets.slack_bot_token }}
+          SLACK_USER_MAPPING: ${{ inputs.slack_user_mapping }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        with:
+          script: |
+            const { findSlackUser, getSlackUserProfile, buildReviewRequestBlocks } = require('./.actions/.github/scripts/slack-user-lookup.js');
+
+            const requestedReviewer = process.env.REQUESTED_REVIEWER;
+            const requestSender = process.env.REQUEST_SENDER;
+            const slackToken = process.env.SLACK_BOT_TOKEN;
+            const userMapping = process.env.SLACK_USER_MAPPING;
+            const prTitle = process.env.PR_TITLE;
+            const prUrl = process.env.PR_URL;
+            const prNumber = process.env.PR_NUMBER;
+            const prBody = process.env.PR_BODY || '';
+
+            // Get request sender's Slack profile (message will appear from them)
+            const senderSlackUser = await findSlackUser({
+              githubUsername: requestSender,
+              slackToken,
+              userMapping,
+              github,
+              core
+            });
+
+            const senderProfile = getSlackUserProfile(senderSlackUser);
+            core.setOutput('username', senderProfile.username);
+            core.setOutput('icon_url', senderProfile.icon_url);
+
+            // Get requested reviewer's Slack profile (to tag them)
+            const reviewerSlackUser = await findSlackUser({
+              githubUsername: requestedReviewer,
+              slackToken,
+              userMapping,
+              github,
+              core
+            });
+
+            const reviewerTag = reviewerSlackUser
+              ? `<@${reviewerSlackUser.id}>`
+              : `@${requestedReviewer}`;
+
+            // Build Slack blocks
+            const blocks = buildReviewRequestBlocks({
+              reviewerTag,
+              prUrl,
+              prTitle,
+              prBody,
+              prNumber,
+              requestSender,
+              requestedReviewer
+            });
+
+            core.setOutput('blocks', JSON.stringify(blocks));
+
+      - name: Send review request notification
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.slack_bot_token }}
+          payload: |
+            {
+              "channel": "${{ inputs.slack_channel_id }}",
+              "text": "Review requested on PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}",
+              "username": "${{ steps.slack-users.outputs.username || '' }}",
+              "icon_url": "${{ steps.slack-users.outputs.icon_url || '' }}",
+              "blocks": ${{ steps.slack-users.outputs.blocks }}
+            }
+
+  # Notifies when a human posts a comment on a PR
+  notify-pr-comment:
+    runs-on: ubuntu-latest
+    # Only run if: it's a comment event, on a PR (not issue), and author is not a bot
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot'
+    steps:
+      - name: Checkout actions repository
+        uses: actions/checkout@v4
+        with:
+          repository: perimetre/actions
+          ref: master
+          path: .actions
+
+      # Look up comment author in Slack and process @mentions
+      - name: Get Slack profile and process mentions
+        id: process-comment
+        uses: actions/github-script@v8
+        env:
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          SLACK_BOT_TOKEN: ${{ secrets.slack_bot_token }}
+          SLACK_USER_MAPPING: ${{ inputs.slack_user_mapping }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+        with:
+          script: |
+            const { findSlackUser, getSlackUserProfile, processMentions, buildCommentBlocks } = require('./.actions/.github/scripts/slack-user-lookup.js');
+
+            const commentAuthor = process.env.COMMENT_AUTHOR;
+            const commentBody = process.env.COMMENT_BODY || '';
+            const slackToken = process.env.SLACK_BOT_TOKEN;
+            const userMapping = process.env.SLACK_USER_MAPPING;
+            const issueTitle = process.env.ISSUE_TITLE;
+            const issueUrl = process.env.ISSUE_URL;
+            const commentUrl = process.env.COMMENT_URL;
+
+            // Get comment author's Slack profile
+            const authorSlackUser = await findSlackUser({
+              githubUsername: commentAuthor,
+              slackToken,
+              userMapping,
+              github,
+              core
+            });
+
+            const authorProfile = getSlackUserProfile(authorSlackUser);
+            core.setOutput('username', authorProfile.username);
+            core.setOutput('icon_url', authorProfile.icon_url);
+            core.setOutput('matched', authorProfile.matched.toString());
+
+            // Process @mentions in comment body
+            const processedBody = await processMentions({
+              text: commentBody.trim(),
+              slackToken,
+              userMapping,
+              github,
+              core
+            });
+
+            // Build Slack blocks
+            const blocks = buildCommentBlocks({
+              commentBody: processedBody,
+              issueUrl,
+              issueTitle,
+              commentUrl,
+              commentAuthor
+            });
+
+            core.setOutput('blocks', JSON.stringify(blocks));
+
+      - name: Send PR comment notification
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.slack_bot_token }}
+          payload: |
+            {
+              "channel": "${{ inputs.slack_channel_id }}",
+              "text": "Comment on PR #${{ github.event.issue.number }}",
+              "username": "${{ steps.process-comment.outputs.username || '' }}",
+              "icon_url": "${{ steps.process-comment.outputs.icon_url || '' }}",
+              "blocks": ${{ steps.process-comment.outputs.blocks }}
+            }
+
+  # Notifies when a code review is submitted
+  notify-pr-review:
+    runs-on: ubuntu-latest
+    # Only run if reviewer is not a bot
+    if: |
+      github.event_name == 'pull_request_review' &&
+      github.event.review.user.type != 'Bot'
+    steps:
+      - name: Checkout actions repository
+        uses: actions/checkout@v4
+        with:
+          repository: perimetre/actions
+          ref: master
+          path: .actions
+
+      - name: Determine review emoji and action
+        id: review-info
+        run: |
+          case "${{ github.event.review.state }}" in
+            "approved")
+              echo "emoji=✅" >> $GITHUB_OUTPUT
+              echo "action=Approved" >> $GITHUB_OUTPUT
+              ;;
+            "changes_requested")
+              echo "emoji=🔄" >> $GITHUB_OUTPUT
+              echo "action=Requested Changes" >> $GITHUB_OUTPUT
+              ;;
+            "commented")
+              echo "emoji=💭" >> $GITHUB_OUTPUT
+              echo "action=Commented" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "emoji=📝" >> $GITHUB_OUTPUT
+              echo "action=Reviewed" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      # Look up reviewer in Slack and process @mentions
+      - name: Get Slack profile and process mentions
+        id: process-review
+        uses: actions/github-script@v8
+        env:
+          REVIEWER: ${{ github.event.review.user.login }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SLACK_BOT_TOKEN: ${{ secrets.slack_bot_token }}
+          SLACK_USER_MAPPING: ${{ inputs.slack_user_mapping }}
+          REVIEW_ACTION: ${{ steps.review-info.outputs.action }}
+          REVIEW_EMOJI: ${{ steps.review-info.outputs.emoji }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
+        with:
+          script: |
+            const { findSlackUser, getSlackUserProfile, processMentions, fetchReviewComments, buildReviewBlocks } = require('./.actions/.github/scripts/slack-user-lookup.js');
+
+            const reviewer = process.env.REVIEWER;
+            let reviewBody = process.env.REVIEW_BODY || '';
+            const reviewId = process.env.REVIEW_ID;
+            const prNumber = process.env.PR_NUMBER;
+            const slackToken = process.env.SLACK_BOT_TOKEN;
+            const userMapping = process.env.SLACK_USER_MAPPING;
+            const reviewAction = process.env.REVIEW_ACTION;
+            const reviewEmoji = process.env.REVIEW_EMOJI;
+            const prTitle = process.env.PR_TITLE;
+            const prUrl = process.env.PR_URL;
+            const reviewUrl = process.env.REVIEW_URL;
+
+            // If review body is empty, fetch review comments (line comments)
+            if (!reviewBody.trim()) {
+              reviewBody = await fetchReviewComments({
+                reviewId,
+                prNumber,
+                github,
+                context,
+                core
+              });
+            }
+
+            // Get reviewer's Slack profile
+            const reviewerSlackUser = await findSlackUser({
+              githubUsername: reviewer,
+              slackToken,
+              userMapping,
+              github,
+              core
+            });
+
+            const reviewerProfile = getSlackUserProfile(reviewerSlackUser);
+            core.setOutput('username', reviewerProfile.username);
+            core.setOutput('icon_url', reviewerProfile.icon_url);
+            core.setOutput('matched', reviewerProfile.matched.toString());
+
+            // Process @mentions in review body
+            const processedBody = await processMentions({
+              text: reviewBody.trim(),
+              slackToken,
+              userMapping,
+              github,
+              core
+            });
+
+            // Build Slack blocks
+            const blocks = buildReviewBlocks({
+              reviewEmoji,
+              reviewAction,
+              reviewBody: processedBody,
+              prUrl,
+              prTitle,
+              reviewUrl,
+              reviewer
+            });
+
+            core.setOutput('blocks', JSON.stringify(blocks));
+
+      - name: Send review notification
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.slack_bot_token }}
+          payload: |
+            {
+              "channel": "${{ inputs.slack_channel_id }}",
+              "text": "PR Review ${{ steps.review-info.outputs.action }}: #${{ github.event.pull_request.number }}",
+              "username": "${{ steps.process-review.outputs.username || '' }}",
+              "icon_url": "${{ steps.process-review.outputs.icon_url || '' }}",
+              "blocks": ${{ steps.process-review.outputs.blocks }}
+            }

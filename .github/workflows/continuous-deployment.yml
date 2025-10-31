@@ -1,0 +1,158 @@
+name: Perimetre - Deployment Success
+
+# Monitors Cloudflare deployments and sends Slack notification on successful deployment.
+#
+# Setup:
+# 1. Add secrets in GitHub organization or repo settings (Settings → Secrets and variables → Actions):
+#    CLOUDFLARE_API_TOKEN - API token with "Workers Scripts: Read" permission
+#    CLOUDFLARE_ACCOUNT_ID - Your Cloudflare account ID
+#    SLACK_BOT_TOKEN - Slack bot OAuth token (starts with xoxb-)
+# 2. Add variables in GitHub organization or repo settings (Variables tab):
+#    CLOUDFLARE_PROJECT_NAME - Cloudflare Pages project name
+#    SLACK_CHANNEL_ID - Slack channel ID for notifications
+
+on:
+  workflow_call:
+    inputs:
+      cloudflare_project_name:
+        description: 'Cloudflare Pages project name'
+        required: true
+        type: string
+      slack_channel_id:
+        description: 'Slack channel ID where notifications will be sent'
+        required: true
+        type: string
+      poll_interval_ms:
+        description: 'Polling interval in milliseconds'
+        required: false
+        type: number
+        default: 10000
+      max_attempts:
+        description: 'Maximum number of polling attempts'
+        required: false
+        type: number
+        default: 120
+    secrets:
+      cloudflare_api_token:
+        description: 'Cloudflare API token with Workers Scripts: Read permission'
+        required: true
+      cloudflare_account_id:
+        description: 'Cloudflare account ID'
+        required: true
+      slack_bot_token:
+        description: 'Slack bot token'
+        required: true
+
+jobs:
+  check-deployment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for successful deployment
+        id: check
+        uses: actions/github-script@v8
+        env:
+          CF_API_TOKEN: ${{ secrets.cloudflare_api_token }}
+          CF_ACCOUNT_ID: ${{ secrets.cloudflare_account_id }}
+          CF_PROJECT_NAME: ${{ inputs.cloudflare_project_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          POLL_INTERVAL_MS: ${{ inputs.poll_interval_ms }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        with:
+          script: |
+            const cfApiToken = process.env.CF_API_TOKEN;
+            const cfAccountId = process.env.CF_ACCOUNT_ID;
+            const cfProjectName = process.env.CF_PROJECT_NAME;
+            const commitSha = process.env.COMMIT_SHA;
+            const pollInterval = parseInt(process.env.POLL_INTERVAL_MS) || 10000;
+            const maxAttempts = parseInt(process.env.MAX_ATTEMPTS) || 120;
+
+            if (!cfApiToken || !cfAccountId || !cfProjectName) {
+              core.setFailed('Missing required secrets/variables');
+              return;
+            }
+
+            core.info(`Monitoring Cloudflare deployment for commit ${commitSha.substring(0, 7)}`);
+
+            const headers = {
+              'Authorization': `Bearer ${cfApiToken}`,
+              'Content-Type': 'application/json'
+            };
+
+            let attempts = 0;
+
+            while (attempts < maxAttempts) {
+              attempts++;
+
+              try {
+                const response = await fetch(
+                  `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/pages/projects/${cfProjectName}/deployments`,
+                  { headers }
+                );
+
+                if (!response.ok) {
+                  throw new Error(`API error: ${response.status} ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                const deployments = data.result || [];
+
+                const deployment = deployments.find(d =>
+                  d.deployment_trigger?.metadata?.commit_hash === commitSha
+                );
+
+                if (deployment) {
+                  core.info(`Found deployment: ${deployment.id}`);
+                  core.info(`Status: ${deployment.latest_stage?.status}`);
+
+                  if (deployment.latest_stage?.status === 'success') {
+                    core.info('Deployment successful!');
+                    core.setOutput('deployment_url', deployment.url);
+                    core.setOutput('deployment_id', deployment.id);
+                    return;
+                  } else if (deployment.latest_stage?.status === 'failure') {
+                    core.info('Deployment failed, workflow will exit without notification');
+                    return;
+                  }
+                }
+
+                core.info(`[${attempts}/${maxAttempts}] Waiting for successful deployment...`);
+                await new Promise(resolve => setTimeout(resolve, pollInterval));
+              } catch (error) {
+                core.error(`Error fetching deployments: ${error.message}`);
+                await new Promise(resolve => setTimeout(resolve, pollInterval));
+              }
+            }
+
+            core.info('Max attempts reached, no successful deployment found');
+
+      - name: Send success notification to Slack
+        if: steps.check.outputs.deployment_url
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.slack_bot_token }}
+          payload: |
+            channel: ${{ inputs.slack_channel_id }}
+            text: "Deployment successful for ${{ github.repository }}"
+            blocks:
+              - type: header
+                text:
+                  type: plain_text
+                  text: "Deployment Successful"
+                  emoji: true
+              - type: section
+                fields:
+                  - type: mrkdwn
+                    text: "*Repository:*\n<${{ github.event.repository.html_url }}|${{ github.repository }}>"
+                  - type: mrkdwn
+                    text: "*Branch:*\n${{ github.ref_name }}"
+                  - type: mrkdwn
+                    text: "*Commit:*\n<${{ github.event.head_commit.url }}|`${{ github.sha }}`>"
+                  - type: mrkdwn
+                    text: "*Author:*\n${{ github.event.head_commit.author.name }}"
+                  - type: mrkdwn
+                    text: "*URL:*\n<${{ steps.check.outputs.deployment_url }}|View Deployment>"
+              - type: section
+                text:
+                  type: mrkdwn
+                  text: "*Commit Message:*\n```${{ github.event.head_commit.message }}```"
