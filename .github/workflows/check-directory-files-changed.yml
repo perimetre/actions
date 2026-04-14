@@ -1,0 +1,70 @@
+name: Check directory has new or changed files
+on:
+  workflow_call:
+    inputs:
+      directoryPath:
+        required: true
+        type: string
+        description: 'Directory path to check for new or changed files (e.g. ".changeset")'
+      ignoreFiles:
+        required: false
+        type: string
+        default: ''
+        description: 'Comma-separated list of filenames to ignore (e.g. "README.md,config.json")'
+      failMessage:
+        required: false
+        type: string
+        default: ''
+        description: 'Custom failure message. Defaults to: No new or changed files found in "<directoryPath>"'
+
+jobs:
+  check_directory_files_changed:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm install parse-diff
+
+      - uses: actions/github-script@v6
+        name: Check for changed files in directory
+        id: diff-result
+        with:
+          script: |
+            const diff_url = context.payload.pull_request.diff_url
+            try {
+              const diff = await github.request(diff_url)
+
+              const parse = require('parse-diff')
+              const files = (parse(diff.data || '') || [])
+
+              const directoryPath = '${{ inputs.directoryPath }}'
+              const ignoreFiles = '${{ inputs.ignoreFiles }}'
+                .split(',')
+                .map(f => f.trim())
+                .filter(Boolean)
+
+              const prefix = directoryPath.endsWith('/') ? directoryPath : directoryPath + '/'
+
+              const matchingFiles = files.filter(f => {
+                const filePath = f.to || ''
+                if (!filePath.startsWith(prefix)) return false
+                const fileName = filePath.split('/').pop()
+                if (ignoreFiles.includes(fileName)) return false
+                return true
+              })
+
+              core.setOutput('hasChanges', matchingFiles.length > 0)
+              core.setOutput('matchedFiles', matchingFiles.map(f => f.to).join(', '))
+              core.info(`Found ${matchingFiles.length} changed file(s) in "${directoryPath}": ${matchingFiles.map(f => f.to).join(', ')}`)
+            } catch (err) {
+              core.warning(`Could not get file diff. Reason: ${err}`)
+              core.setOutput('hasChanges', false)
+              core.setOutput('matchedFiles', '')
+            }
+
+      - name: Fail if no files changed in directory
+        if: ${{ steps.diff-result.outputs.hasChanges != 'true' }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const customMessage = `${{ inputs.failMessage }}`
+            const defaultMessage = `No new or changed files found in "${{ inputs.directoryPath }}"`
+            core.setFailed(customMessage || defaultMessage)
