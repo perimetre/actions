@@ -26,6 +26,9 @@ jobs:
       - uses: actions/github-script@v6
         name: Check for changed files in directory
         id: diff-result
+        env:
+          INPUT_DIRECTORY_PATH: ${{ inputs.directoryPath }}
+          INPUT_IGNORE_FILES: ${{ inputs.ignoreFiles }}
         with:
           script: |
             const diff_url = context.payload.pull_request.diff_url
@@ -35,8 +38,8 @@ jobs:
               const parse = require('parse-diff')
               const files = (parse(diff.data || '') || [])
 
-              const directoryPath = '${{ inputs.directoryPath }}'
-              const ignoreFiles = '${{ inputs.ignoreFiles }}'
+              const directoryPath = process.env.INPUT_DIRECTORY_PATH || ''
+              const ignoreFiles = (process.env.INPUT_IGNORE_FILES || '')
                 .split(',')
                 .map(f => f.trim())
                 .filter(Boolean)
@@ -63,8 +66,12 @@ jobs:
       - name: Fail if no files changed in directory
         if: ${{ steps.diff-result.outputs.hasChanges != 'true' }}
         uses: actions/github-script@v6
+        env:
+          INPUT_FAIL_MESSAGE: ${{ inputs.failMessage }}
+          INPUT_DIRECTORY_PATH: ${{ inputs.directoryPath }}
         with:
           script: |
-            const customMessage = `${{ inputs.failMessage }}`
-            const defaultMessage = `No new or changed files found in "${{ inputs.directoryPath }}"`
+            const customMessage = process.env.INPUT_FAIL_MESSAGE || ''
+            const directoryPath = process.env.INPUT_DIRECTORY_PATH || ''
+            const defaultMessage = `No new or changed files found in "${directoryPath}"`
             core.setFailed(customMessage || defaultMessage)
