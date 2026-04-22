@@ -15,6 +15,8 @@ jobs:
       - uses: actions/github-script@v6
         name: Setup file diff variables
         id: diff-result
+        env:
+          INPUT_FILE_PATH: ${{ inputs.filePath }}
         with:
           script: |
             const diff_url = context.payload.pull_request.diff_url
@@ -24,7 +26,7 @@ jobs:
               const parse = require('parse-diff')
               const files = (parse(diff.data || '') || [])
 
-              const filePath = '${{ inputs.filePath }}'
+              const filePath = process.env.INPUT_FILE_PATH || ''
               const fileDiff = files.filter(x => x.to === filePath)
 
               if (fileDiff.length > 0) {
@@ -44,6 +46,9 @@ jobs:
       - name: Fail if not new or skip otherwise
         if: ${{ steps.diff-result.outputs.hasBeenUpdated != 'true' }}
         uses: actions/github-script@v6
+        env:
+          INPUT_FILE_PATH: ${{ inputs.filePath }}
         with:
           script: |
-            core.setFailed('"${{ inputs.filePath }}" has not been updated')
+            const filePath = process.env.INPUT_FILE_PATH || ''
+            core.setFailed(`"${filePath}" has not been updated`)
