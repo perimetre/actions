@@ -13,7 +13,7 @@ name: Slack PR Notifications
 # - SLACK_CHANNEL_ID variable (organization or repository)
 # - SLACK_USER_MAPPING variable (optional)
 #   JSON mapping of GitHub username to Slack user ID for manual overrides
-#   Example: {"singithi-kandage": "U12345678", "assisrmatheus": "U87654321"}
+#   Example: {"github-username": "U12345678", "another-username": "U87654321"}
 #   To get Slack user IDs: Click user profile > More > Copy member ID
 #
 # How it works:
