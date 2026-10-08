@@ -1,0 +1,126 @@
+name: Slack Deployment Notifications
+
+# Posts the result of a deploy that runs in GitHub Actions to Slack, in the message format of
+# perimetre/cloudflare-notifications (the Workers Builds notifier): ✅ Deployed or 🟥 Build Failed, the commit's first
+# line, the failed step on a failure, then repository • label • author • branch. Cancelled and skipped deploys post
+# nothing.
+#
+# Prerequisites:
+# - SLACK_BOT_TOKEN secret (organization or repository), scope chat:write, the bot invited to the channel
+# - SLACK_CHANNEL_ID variable (organization or repository)
+#
+# Usage, as a job after the deploy job (actions: read lets it name the failed step):
+#
+#   notify:
+#     needs: deploy
+#     if: always()
+#     permissions:
+#       actions: read
+#       contents: read
+#     uses: perimetre/actions/.github/workflows/slack-deployment-notifications.yml@master
+#     with:
+#       slack_channel_id: ${{ vars.SLACK_CHANNEL_ID }}
+#       status: ${{ needs.deploy.result }}
+#       label: Production
+#     secrets:
+#       slack_bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
+
+on:
+  workflow_call:
+    inputs:
+      slack_channel_id:
+        description: 'Slack channel ID where notifications will be sent'
+        required: true
+        type: string
+      status:
+        description: "The deploy job's result (needs.<job>.result): success, failure, cancelled or skipped"
+        required: true
+        type: string
+      label:
+        description: 'Display name of what was deployed, e.g. "CMS Production"'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      slack_bot_token:
+        description: 'Slack bot token with chat:write'
+        required: true
+
+jobs:
+  notify:
+    if: inputs.status == 'success' || inputs.status == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Send deployment notification to Slack
+        uses: actions/github-script@v8
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.slack_bot_token }}
+          SLACK_CHANNEL_ID: ${{ inputs.slack_channel_id }}
+          DEPLOY_STATUS: ${{ inputs.status }}
+          DEPLOY_LABEL: ${{ inputs.label }}
+        with:
+          script: |
+            const { SLACK_BOT_TOKEN: token, SLACK_CHANNEL_ID: channel, DEPLOY_STATUS, DEPLOY_LABEL: label } = process.env;
+            const { owner, repo } = context.repo;
+            const repoFullName = `${owner}/${repo}`;
+            const logsUrl = `${context.serverUrl}/${repoFullName}/actions/runs/${context.runId}`;
+            const isSuccess = DEPLOY_STATUS === 'success';
+
+            // The API has the commit for any event; a manual run has no head_commit in its payload.
+            let commit = { message: '', author: context.actor, url: `${context.serverUrl}/${repoFullName}/commit/${context.sha}` };
+            try {
+              const { data } = await github.rest.repos.getCommit({ owner, repo, ref: context.sha });
+              commit = { message: data.commit.message, author: data.author?.login ?? data.commit.author?.name ?? context.actor, url: data.html_url };
+            } catch (error) {
+              core.warning(`Could not read commit ${context.sha}: ${error.message}`);
+            }
+
+            // The first failed step of the run stands in for the build log's first error.
+            let errorMessage = '';
+            if (!isSuccess) {
+              try {
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+                  owner,
+                  repo,
+                  run_id: context.runId,
+                  attempt_number: Number(process.env.GITHUB_RUN_ATTEMPT),
+                });
+                const failedJob = jobs.find((job) => job.conclusion === 'failure');
+                const failedStep = failedJob?.steps?.find((step) => step.conclusion === 'failure');
+                if (failedStep) errorMessage = `${failedJob.name} › ${failedStep.name}`;
+              } catch (error) {
+                core.warning(`Could not read the failed step (does the caller grant actions: read?): ${error.message}`);
+              }
+            }
+
+            const emoji = isSuccess ? '✅' : '🟥';
+            const action = isSuccess ? 'Deployed' : 'Build Failed';
+            const firstLine = commit.message.split('\n')[0] || '';
+
+            let mainText = `${emoji} *<${logsUrl}|${action}>*`;
+            if (firstLine) mainText += `\n${firstLine}`;
+            if (errorMessage) mainText += `\n\`\`\`${errorMessage}\`\`\``;
+
+            const contextParts = [`<${commit.url}|${repoFullName}>`];
+            if (label) contextParts.push(label);
+            if (commit.author) contextParts.push(commit.author);
+            contextParts.push(`\`${context.ref.replace('refs/heads/', '')}\``);
+            if (!isSuccess) contextParts.push('Check build logs');
+
+            const response = await fetch('https://slack.com/api/chat.postMessage', {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' },
+              body: JSON.stringify({
+                channel,
+                text: `${emoji} ${action}: ${label || repoFullName} – ${firstLine}`,
+                blocks: [
+                  { type: 'section', text: { type: 'mrkdwn', text: mainText } },
+                  { type: 'context', elements: [{ type: 'mrkdwn', text: contextParts.join(' • ') }] },
+                ],
+              }),
+            });
+            const result = await response.json();
+            if (!result.ok) core.setFailed(`Slack chat.postMessage failed: ${result.error}`);
